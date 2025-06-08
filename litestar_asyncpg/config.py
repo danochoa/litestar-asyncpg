@@ -26,7 +26,6 @@ if TYPE_CHECKING:
     from litestar.types import BeforeMessageSendHookHandler, EmptyType, Message, Scope
 
 
-CONNECTION_SCOPE_KEY = "_asyncpg_db_connection"
 SESSION_TERMINUS_ASGI_EVENTS = {HTTP_RESPONSE_START, HTTP_DISCONNECT, WEBSOCKET_DISCONNECT, WEBSOCKET_CLOSE}
 T = TypeVar("T")
 
@@ -35,20 +34,6 @@ if TYPE_CHECKING:
 else:
     AsyncpgConnection: TypeAlias = "Union[Connection, PoolConnectionProxy]"
 
-
-async def default_before_send_handler(message: "Message", scope: "Scope") -> None:
-    """Handle closing and cleaning up sessions before sending.
-
-    Args:
-        message: ASGI-``Message``
-        scope: An ASGI-``Scope``
-
-    Returns:
-        None
-    """
-    session = cast("Union[PoolConnectionProxy,Connection,None]", get_scope_state(scope, CONNECTION_SCOPE_KEY))
-    if session  is not None and message["type"] in SESSION_TERMINUS_ASGI_EVENTS:
-        delete_scope_state(scope, CONNECTION_SCOPE_KEY)
 
 def serializer(value: "Any") -> str:
     """Serialize JSON field values.
@@ -116,7 +101,7 @@ class AsyncpgConfig:
     """Key under which to store the asyncpg Pool in the application dependency injection map.    """
     connection_dependency_key: str = "db_connection"
     """Key under which to store the asyncpg Pool in the application dependency injection map.    """
-    before_send_handler: "BeforeMessageSendHookHandler" = default_before_send_handler
+    before_send_handler: "BeforeMessageSendHookHandler" = None
     """Handler to call before the ASGI message is sent.
 
     The handler should handle closing the session stored in the ASGI scope, if it's still open, and committing and
@@ -134,6 +119,11 @@ class AsyncpgConfig:
 
     If set, the plugin will use the provided pool rather than instantiate one.
     """
+
+    def __post_init__(self):
+        self.session_scope_key = f"_asyncpg_{self.connection_dependency_key}"
+        if self.before_send_handler is None:
+            self.before_send_handler = self.default_before_send_handler()
 
     @property
     def pool_config_dict(self) -> "dict[str, Any]":
@@ -168,6 +158,24 @@ class AsyncpgConfig:
             "ConnectionMeta": ConnectionMeta,
             "AsyncpgConnection": AsyncpgConnection,
         }
+
+    def default_before_send_handler(self) -> "Callable[[Message, Scope], Coroutine[Any, Any, None]]":
+        async def before_send_handler(message: "Message", scope: "Scope") -> None:
+            """Handle closing and cleaning up sessions before sending.
+
+            Args:
+                message: ASGI-``Message``
+                scope: An ASGI-``Scope``
+
+            Returns:
+                None
+            """
+            session = cast("Union[PoolConnectionProxy,Connection,None]", get_scope_state(scope, self.session_scope_key))
+            if session  is not None and message["type"] in SESSION_TERMINUS_ASGI_EVENTS:
+                delete_scope_state(scope, self.session_scope_key)
+
+        return before_send_handler
+
 
     async def create_pool(self) -> Pool:
         """Return a pool. If none exists yet, create one.
@@ -254,12 +262,12 @@ class AsyncpgConfig:
         Returns:
             A connection instance.
         """
-        connection = cast("Optional[Union[Connection, PoolConnectionProxy]]", get_scope_state(scope, CONNECTION_SCOPE_KEY))
+        connection = cast("Optional[Union[Connection, PoolConnectionProxy]]", get_scope_state(scope, self.session_scope_key))
         if connection is None:
             pool = cast("Pool", state.get(self.pool_app_state_key))
 
             async with pool.acquire() as connection:
-                set_scope_state(scope, CONNECTION_SCOPE_KEY, connection)
+                set_scope_state(scope, self.session_scope_key, connection)
                 yield connection
 
     @asynccontextmanager
